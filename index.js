@@ -8,6 +8,11 @@ const {
   ButtonStyle,
   PermissionsBitField
 } = require("discord.js");
+const fs = require("fs");
+
+// ✅ CRASH SHIELD
+process.on("unhandledRejection", err => console.error("UNHANDLED:", err));
+process.on("uncaughtException", err => console.error("UNCAUGHT:", err));
 
 const client = new Client({
   intents: [
@@ -17,113 +22,151 @@ const client = new Client({
   ]
 });
 
+const STAFF_ROLE = "Staff";
 let raidMode = false;
-let joinTimestamps = [];
-let banVotes = new Map();
+let blacklist = new Set();
+let backupData = null;
 
+// ✅ READY
 client.once("ready", () => {
   console.log(`✅ Bot online as ${client.user.tag}`);
 });
 
-// ✅ STAFF LOG FUNCTION
-async function logStaffAction(guild, message) {
+// ✅ STAFF LOGGING
+async function logStaff(guild, msg) {
   const channel = guild.channels.cache.find(c => c.name === "staff-logs");
   if (!channel) return;
-  channel.send({ embeds: [new EmbedBuilder().setDescription(message).setColor(0xff0000)] });
+  channel.send({ embeds: [new EmbedBuilder().setColor(0xff0000).setDescription(msg)] });
 }
 
-// ✅ JOIN PROTECTION + ANTI ALT + RAID MODE
-client.on("guildMemberAdd", async member => {
-  const accountAgeDays =
-    (Date.now() - member.user.createdTimestamp) / 86400000;
+// ✅ CHANNEL LOCK / UNLOCK
+async function setChannelLock(guild, locked) {
+  guild.channels.cache.forEach(async channel => {
+    if (!channel.isTextBased()) return;
+    try {
+      await channel.permissionOverwrites.edit(guild.roles.everyone, {
+        SendMessages: !locked
+      });
+    } catch {}
+  });
+}
 
-  if (accountAgeDays < Number(process.env.MIN_ACCOUNT_AGE_DAYS)) {
-    await member.kick("Account too new (Anti‑Alt)");
-    return logStaffAction(member.guild, `🚫 Auto‑kicked alt: ${member.user.tag}`);
+// ✅ JOIN PROTECTION
+client.on("guildMemberAdd", async member => {
+  if (blacklist.has(member.id)) {
+    await member.ban({ reason: "Blacklisted User" });
+    return logStaff(member.guild, `⛔ Blacklisted auto‑ban: ${member.user.tag}`);
+  }
+
+  const age = (Date.now() - member.user.createdTimestamp) / 86400000;
+  if (age < Number(process.env.MIN_ACCOUNT_AGE_DAYS)) {
+    blacklist.add(member.id);
+    await member.kick("Alt Account");
+    return logStaff(member.guild, `🚫 Alt detected: ${member.user.tag}`);
   }
 
   if (raidMode) {
-    joinTimestamps.push(Date.now());
-    await member.kick("Raid Mode Active");
-    return logStaffAction(member.guild, `🚨 Auto‑kicked during raid: ${member.user.tag}`);
+    blacklist.add(member.id);
+    await member.kick("Raid Mode");
+    return logStaff(member.guild, `🚨 Raid kick: ${member.user.tag}`);
   }
 });
 
-// ✅ CAPTCHA VERIFY
+// ✅ EMOJI SPAM AUTO PURGE (DELETE + WARN + TIMEOUT)
+client.on("messageCreate", async message => {
+  if (message.author.bot) return;
+
+  const emojiCount = (message.content.match(/(\p{Emoji_Presentation}|\p{Emoji}\uFE0F)/gu) || []).length;
+  if (emojiCount >= 10) {
+    try {
+      await message.delete();
+      await message.member.timeout(10 * 60 * 1000, "Emoji Spam"); // 10 min
+      await logStaff(message.guild, `🚨 Emoji spam timeout: ${message.author.tag}`);
+    } catch {}
+  }
+});
+
+// ✅ INTERACTIONS
 client.on("interactionCreate", async interaction => {
-  if (!interaction.isChatInputCommand()) return;
+  try {
+    if (!interaction.isChatInputCommand()) return;
 
-  if (interaction.commandName === "verify") {
-    const row = new ActionRowBuilder().addComponents(
-      new ButtonBuilder()
-        .setCustomId("captcha_pass")
-        .setLabel("✅ Click to Verify")
-        .setStyle(ButtonStyle.Success)
-    );
-    return interaction.reply({
-      content: "Complete captcha to verify:",
-      components: [row],
-      ephemeral: true
-    });
-  }
+    const isStaff = interaction.member.roles.cache.some(r => r.name === STAFF_ROLE)
+      || interaction.member.permissions.has(PermissionsBitField.Flags.Administrator);
 
-  // ✅ RAID MODE TOGGLE
-  if (interaction.commandName === "raidmode") {
-    raidMode = !raidMode;
-    await logStaffAction(
-      interaction.guild,
-      `🚨 Raid Mode is now ${raidMode ? "ON" : "OFF"}`
-    );
-    return interaction.reply(`🚨 Raid Mode is now ${raidMode ? "ON" : "OFF"}`);
-  }
+    // ✅ CAPTCHA VERIFY
+    if (interaction.commandName === "verify") {
+      const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId("captcha_pass").setLabel("✅ Verify").setStyle(ButtonStyle.Success)
+      );
+      return interaction.reply({ content: "Captcha:", components: [row], ephemeral: true });
+    }
 
-  // ✅ BAN VOTE SYSTEM
-  if (interaction.commandName === "banvote") {
-    const user = interaction.options.getUser("user");
-    banVotes.set(user.id, 0);
+    // ✅ RAID MODE
+    if (interaction.commandName === "raidmode") {
+      if (!isStaff) return interaction.reply({ content: "❌ Staff only", ephemeral: true });
+      raidMode = !raidMode;
+      await setChannelLock(interaction.guild, raidMode);
 
-    const row = new ActionRowBuilder().addComponents(
-      new ButtonBuilder()
-        .setCustomId(`yes_${user.id}`)
-        .setLabel("✅ Yes")
-        .setStyle(ButtonStyle.Danger),
-      new ButtonBuilder()
-        .setCustomId(`no_${user.id}`)
-        .setLabel("❌ No")
-        .setStyle(ButtonStyle.Secondary)
-    );
+      const status = raidMode ? "ON — Channels Locked" : "OFF — Channels Unlocked";
+      await logStaff(interaction.guild, `🚨 Raid Mode ${status}`);
+      return interaction.reply(`🚨 Raid Mode is now **${status}**`);
+    }
 
-    return interaction.reply({
-      embeds: [new EmbedBuilder().setTitle("🛑 Ban Vote Started").setDescription(`Vote to ban **${user.tag}**`)],
-      components: [row]
-    });
+    // ✅ BACKUP SERVER
+    if (interaction.commandName === "backup") {
+      if (!isStaff) return interaction.reply({ content: "❌ Staff only", ephemeral: true });
+
+      backupData = {
+        roles: interaction.guild.roles.cache.map(r => r.name),
+        channels: interaction.guild.channels.cache.map(c => ({
+          name: c.name,
+          type: c.type
+        }))
+      };
+
+      fs.writeFileSync("backup.json", JSON.stringify(backupData, null, 2));
+      await logStaff(interaction.guild, "💾 Server backup created");
+      return interaction.reply("✅ Backup saved.");
+    }
+
+    // ✅ RESTORE SERVER
+    if (interaction.commandName === "restore") {
+      if (!isStaff) return interaction.reply({ content: "❌ Staff only", ephemeral: true });
+      if (!fs.existsSync("backup.json")) return interaction.reply("❌ No backup found.");
+
+      const data = JSON.parse(fs.readFileSync("backup.json"));
+
+      for (const ch of data.channels) {
+        await interaction.guild.channels.create({ name: ch.name, type: ch.type }).catch(() => {});
+      }
+
+      await logStaff(interaction.guild, "♻️ Server restored from backup");
+      return interaction.reply("✅ Server restore started.");
+    }
+
+    // ✅ BOT RESET
+    if (interaction.commandName === "botreset") {
+      if (!isStaff) return interaction.reply({ content: "❌ Staff only", ephemeral: true });
+      await interaction.reply("♻️ Restarting bot...");
+      process.exit(0);
+    }
+
+  } catch (err) {
+    console.error("COMMAND ERROR:", err);
   }
 });
 
-// ✅ BUTTON HANDLER (Captcha + Ban Vote)
+// ✅ BUTTON HANDLER
 client.on("interactionCreate", async interaction => {
   if (!interaction.isButton()) return;
 
-  // CAPTCHA PASS
   if (interaction.customId === "captcha_pass") {
     const role = interaction.guild.roles.cache.find(r => r.name === "Verified");
     if (role) await interaction.member.roles.add(role);
-    return interaction.reply({ content: "✅ You are verified!", ephemeral: true });
-  }
-
-  // BAN VOTE SYSTEM
-  if (interaction.customId.startsWith("yes_")) {
-    const userId = interaction.customId.split("_")[1];
-    banVotes.set(userId, banVotes.get(userId) + 1);
-
-    if (banVotes.get(userId) >= 3) {
-      const member = await interaction.guild.members.fetch(userId);
-      await member.ban({ reason: "Ban Vote Passed" });
-      return logStaffAction(interaction.guild, `🔨 Auto‑banned via vote: ${member.user.tag}`);
-    }
-
-    return interaction.reply({ content: "✅ Vote counted", ephemeral: true });
+    return interaction.reply({ content: "✅ Verified!", ephemeral: true });
   }
 });
 
+// ✅ LOGIN
 client.login(process.env.TOKEN);
