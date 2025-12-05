@@ -1,14 +1,17 @@
 {
-  "name": "stormworks-bot",
+  "name": "raid-protection-bot",
   "version": "1.0.0",
+  "description": "Advanced Discord raid protection & moderation bot",
   "main": "index.js",
   "type": "commonjs",
   "scripts": {
     "start": "node index.js"
   },
+  "author": "Your Name",
+  "license": "MIT",
   "dependencies": {
+    "better-sqlite3": "^9.4.0",
     "discord.js": "^14.15.3",
-    "dotenv": "^16.4.5",
-    "better-sqlite3": "^11.1.0"
+    "dotenv": "^16.4.5"
   }
 }
